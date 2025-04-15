@@ -8,10 +8,10 @@ with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
     context = browser.new_context()
 
-    context.add_cookies(cookies)  # ⚠️ ça doit se faire AVANT l'ouverture de la page
+    context.add_cookies(cookies)
     page = context.new_page()
     page.goto("https://sora.com")
 
-    input("➡️ Vérifie que tu es connecté. Appuie sur Entrée pour sauvegarder la session...")
+    input("Verify you're connected. Press Enter to save the session...")
     context.storage_state(path="session.json")
     browser.close()
