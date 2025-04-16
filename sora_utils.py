@@ -4,13 +4,18 @@ Contains helper functions for browser interactions, DOM manipulation, and error 
 """
 import os
 import re
+import sys
 import time
 import base64
 import hashlib
 import logging
 import unittest
+import imghdr
+import signal
+import io
+from unittest import mock
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple, Callable
+from typing import Optional, Dict, Any, List, Tuple, Callable, Union, IO
 
 DEFAULT_CONFIG = {
     "SORA_URL": "https://sora.com",
@@ -20,6 +25,7 @@ DEFAULT_CONFIG = {
     "RETRY_DELAY": "2",
     "WAIT_TIMEOUT": "60",
     "GENERATION_TIMEOUT": "300",
+    "MAX_SESSION_TIME": "600",  # Global timeout for the entire script (10 minutes)
     "IMAGE_DIR": "images",
     "LOG_DIR": "logs"
 }
@@ -119,7 +125,7 @@ def generate_image_filename(prompt: str, image_dir: Optional[str] = None) -> str
     
     return os.path.join(image_dir, filename)
 
-def with_retry(max_retries: Optional[int] = None, retry_delay: Optional[int] = None) -> Callable:
+def with_retry(max_retries: Optional[int] = None, retry_delay: Optional[Union[int, float]] = None) -> Callable:
     """
     Decorator to add retry logic to functions.
     
@@ -134,7 +140,7 @@ def with_retry(max_retries: Optional[int] = None, retry_delay: Optional[int] = N
         max_retries = int(CONFIG["MAX_RETRIES"])
         
     if retry_delay is None:
-        retry_delay = int(CONFIG["RETRY_DELAY"])
+        retry_delay = float(CONFIG["RETRY_DELAY"])
     
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -297,6 +303,54 @@ def wait_for_image_generation(page, logger: logging.Logger, timeout: Optional[in
     logger.error(f"Timeout after {timeout} seconds waiting for image generation")
     return False
 
+def validate_image(image_path: str, logger: logging.Logger) -> bool:
+    """
+    Validate that the downloaded image is a valid PNG file.
+    
+    Args:
+        image_path: Path to the image file
+        logger: Logger instance
+        
+    Returns:
+        True if the image is valid, False otherwise
+    """
+    try:
+        if not os.path.exists(image_path):
+            logger.error(f"Image file not found: {image_path}")
+            return False
+            
+        file_size = os.path.getsize(image_path)
+        if file_size == 0:
+            logger.error(f"Image file is empty: {image_path}")
+            return False
+            
+        image_format = imghdr.what(image_path)
+        if image_format != 'png':
+            logger.error(f"Invalid image format: {image_format}, expected 'png'")
+            return False
+            
+        try:
+            from PIL import Image
+            img = Image.open(image_path)
+            img.verify()  # Verify that it's a valid image
+            
+            img = Image.open(image_path)  # Need to reopen after verify
+            width, height = img.size
+            logger.info(f"Validated image: {width}x{height} pixels, format={img.format}")
+            
+        except ImportError:
+            logger.info("PIL not available, skipping advanced image validation")
+        except Exception as e:
+            logger.error(f"Image validation failed with PIL: {str(e)}")
+            return False
+            
+        logger.info(f"Image validation successful: {image_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error validating image: {str(e)}")
+        return False
+
 @with_retry()
 def download_image(page, image_path: str, logger: logging.Logger) -> bool:
     """
@@ -337,11 +391,17 @@ def download_image(page, image_path: str, logger: logging.Logger) -> bool:
             raise Exception("Could not extract image data")
             
         image_data = image_data_match.group(1)
+        image_bytes = base64.b64decode(image_data)
+        
         with open(image_path, "wb") as f:
-            f.write(base64.b64decode(image_data))
+            f.write(image_bytes)
             
         image_page.close()
-        logger.info(f"Image successfully saved to {image_path}")
+        
+        if not validate_image(image_path, logger):
+            raise Exception("Image validation failed")
+            
+        logger.info(f"Image successfully saved and validated: {image_path}")
         return True
         
     except Exception as e:
@@ -458,5 +518,311 @@ class TestSoraUtils(unittest.TestCase):
         self.assertIn("Status: FAILURE", log_output)
         self.assertIn("Error: Something went wrong", log_output)
 
+def setup_global_timeout(timeout: Optional[int] = None, logger: Optional[logging.Logger] = None) -> None:
+    """
+    Set up a global timeout for the entire script.
+    
+    Args:
+        timeout: Maximum time in seconds for the script to run
+        logger: Logger instance
+    """
+    if timeout is None:
+        timeout = int(CONFIG["MAX_SESSION_TIME"])
+        
+    def timeout_handler(signum, frame):
+        error_msg = f"CRITICAL: Global session timeout exceeded ({timeout}s)"
+        if logger:
+            logger.critical(error_msg)
+        else:
+            print(error_msg)
+        sys.exit(1)
+        
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout)
+    
+    if logger:
+        logger.info(f"Global session timeout set to {timeout} seconds")
+
+def verify_navigation(page, logger: logging.Logger, url: Optional[str] = None) -> bool:
+    """
+    Verify that navigation to the Sora website was successful.
+    
+    Args:
+        page: Playwright page object
+        logger: Logger instance
+        url: URL that was navigated to
+        
+    Returns:
+        True if navigation was successful, False otherwise
+    """
+    if url is None:
+        url = CONFIG["SORA_URL"]
+        
+    try:
+        title = page.title()
+        if "Sora" not in title:
+            logger.error(f"Navigation verification failed: unexpected title '{title}'")
+            return False
+            
+        # Check for a stable page element
+        stable_element = "textarea, .logo, nav"
+        try:
+            page.wait_for_selector(stable_element, state="visible", timeout=5000)
+        except Exception as e:
+            logger.error(f"Navigation verification failed: could not find stable element: {str(e)}")
+            return False
+            
+        # Check for error elements
+        has_error, error_message = check_for_errors(page, logger)
+        if has_error:
+            logger.error(f"Navigation verification failed: error on page: {error_message}")
+            return False
+            
+        logger.info(f"Navigation to {url} verified successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Navigation verification failed with exception: {str(e)}")
+        return False
+
+class TestRetryDecorator(unittest.TestCase):
+    """Unit tests for retry-decorated functions."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.logger = logging.getLogger("test_logger")
+        self.logger.setLevel(logging.INFO)
+        
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+            
+        self.log_stream = io.StringIO()
+        handler = logging.StreamHandler(self.log_stream)
+        formatter = logging.Formatter('[%(levelname)s]: %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        
+    def test_with_retry_decorator(self):
+        """Test the with_retry decorator."""
+        mock_func = mock.Mock(side_effect=[Exception("First failure"), 
+                                          Exception("Second failure"), 
+                                          "Success"])
+        
+        # Apply the retry decorator
+        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(mock_func)
+        
+        result = decorated_func(self.logger)
+        
+        self.assertEqual(mock_func.call_count, 3)
+        
+        self.assertEqual(result, "Success")
+        
+        log_output = self.log_stream.getvalue()
+        self.assertIn("Attempt 1/3 failed", log_output)
+        self.assertIn("Attempt 2/3 failed", log_output)
+        self.assertIn("First failure", log_output)
+        self.assertIn("Second failure", log_output)
+        
+    def test_with_retry_all_failures(self):
+        """Test the with_retry decorator when all attempts fail."""
+        mock_func = mock.Mock(side_effect=Exception("Persistent failure"))
+        
+        # Apply the retry decorator
+        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(mock_func)
+        
+        with self.assertRaises(Exception) as context:
+            decorated_func(self.logger)
+            
+        self.assertEqual(mock_func.call_count, 3)
+        
+        self.assertEqual(str(context.exception), "Persistent failure")
+        
+        log_output = self.log_stream.getvalue()
+        self.assertIn("Attempt 1/3 failed", log_output)
+        self.assertIn("Attempt 2/3 failed", log_output)
+        self.assertIn("Attempt 3/3 failed", log_output)
+        self.assertIn("All 3 attempts failed", log_output)
+        
+class TestWaitForElement(unittest.TestCase):
+    """Unit tests for wait_for_element function."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.logger = logging.getLogger("test_logger")
+        self.logger.setLevel(logging.INFO)
+        
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+            
+        self.log_stream = io.StringIO()
+        handler = logging.StreamHandler(self.log_stream)
+        formatter = logging.Formatter('[%(levelname)s]: %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        
+        # Create mock page object
+        self.mock_page = mock.Mock()
+        
+    def test_wait_for_element_success(self):
+        """Test wait_for_element with successful scenario."""
+        self.mock_page.wait_for_selector.return_value = True
+        
+        result = wait_for_element(self.mock_page, "test-selector", self.logger, timeout=1)
+        
+        self.assertTrue(result)
+        
+        self.mock_page.wait_for_selector.assert_called_once_with(
+            "test-selector", state="visible", timeout=1000
+        )
+        
+    def test_wait_for_element_with_retries(self):
+        """Test wait_for_element with failures then success."""
+        self.mock_page.wait_for_selector.side_effect = [
+            Exception("First failure"),
+            Exception("Second failure"),
+            True
+        ]
+        
+        # Call the function with retry decorator
+        original_decorator = with_retry
+        try:
+            with_retry.__globals__['with_retry'] = lambda max_retries=3, retry_delay=0.1: original_decorator(max_retries, retry_delay)
+            
+            result = wait_for_element(self.mock_page, "test-selector", self.logger, timeout=1)
+            
+            self.assertTrue(result)
+            
+            self.assertEqual(self.mock_page.wait_for_selector.call_count, 3)
+            
+            log_output = self.log_stream.getvalue()
+            self.assertIn("Element not found", log_output)
+            self.assertIn("First failure", log_output)
+            self.assertIn("Second failure", log_output)
+            
+        finally:
+            # Restore original decorator
+            with_retry.__globals__['with_retry'] = original_decorator
+            
+class TestDownloadImage(unittest.TestCase):
+    """Unit tests for download_image function."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.logger = logging.getLogger("test_logger")
+        self.logger.setLevel(logging.INFO)
+        
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+            
+        self.log_stream = io.StringIO()
+        handler = logging.StreamHandler(self.log_stream)
+        formatter = logging.Formatter('[%(levelname)s]: %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        
+        self.mock_page = mock.Mock()
+        self.mock_context = mock.Mock()
+        self.mock_image_page = mock.Mock()
+        
+        self.mock_page.context = self.mock_context
+        self.mock_context.new_page.return_value = self.mock_image_page
+        
+        self.test_dir = "test_images"
+        if not os.path.exists(self.test_dir):
+            os.makedirs(self.test_dir)
+        
+        self.test_image_path = os.path.join(self.test_dir, "test_image.png")
+        
+        self.original_validate_image = validate_image
+        validate_image.__globals__['validate_image'] = lambda image_path, logger: True
+        
+    def tearDown(self):
+        """Clean up after tests."""
+        validate_image.__globals__['validate_image'] = self.original_validate_image
+        
+        if os.path.exists(self.test_image_path):
+            os.remove(self.test_image_path)
+            
+        if os.path.exists(self.test_dir):
+            try:
+                os.rmdir(self.test_dir)
+            except:
+                pass
+                
+    def test_download_image_success(self):
+        """Test download_image with successful scenario."""
+        self.mock_page.get_attribute.return_value = "image-src-url"
+        self.mock_image_page.content.return_value = '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">'
+        
+        # Patch wait_for_element to return True
+        original_wait_for_element = wait_for_element
+        wait_for_element.__globals__['wait_for_element'] = lambda *args, **kwargs: True
+        
+        try:
+            result = download_image(self.mock_page, self.test_image_path, self.logger)
+            
+            self.assertTrue(result)
+            
+            self.assertTrue(os.path.exists(self.test_image_path))
+            
+            self.mock_page.click.assert_called_once()
+            self.mock_page.get_attribute.assert_called_once()
+            self.mock_context.new_page.assert_called_once()
+            self.mock_image_page.goto.assert_called_once_with("image-src-url")
+            self.mock_image_page.content.assert_called_once()
+            self.mock_image_page.close.assert_called_once()
+            
+        finally:
+            wait_for_element.__globals__['wait_for_element'] = original_wait_for_element
+            
+    def test_download_image_with_retries(self):
+        """Test download_image with failures then success."""
+        self.mock_page.click.side_effect = [
+            Exception("First failure"),
+            Exception("Second failure"),
+            None  # Success on third attempt
+        ]
+        
+        self.mock_page.get_attribute.return_value = "image-src-url"
+        self.mock_image_page.content.return_value = '<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">'
+        
+        # Patch wait_for_element to return True
+        original_wait_for_element = wait_for_element
+        wait_for_element.__globals__['wait_for_element'] = lambda *args, **kwargs: True
+        
+        original_decorator = with_retry
+        
+        try:
+            with_retry.__globals__['with_retry'] = lambda max_retries=3, retry_delay=0.1: original_decorator(max_retries, retry_delay)
+            
+            result = download_image(self.mock_page, self.test_image_path, self.logger)
+            
+            self.assertTrue(result)
+            
+            self.assertEqual(self.mock_page.click.call_count, 3)
+            
+            log_output = self.log_stream.getvalue()
+            self.assertIn("Attempt 1/3 failed", log_output)
+            self.assertIn("Attempt 2/3 failed", log_output)
+            self.assertIn("First failure", log_output)
+            self.assertIn("Second failure", log_output)
+            
+        finally:
+            with_retry.__globals__['with_retry'] = original_decorator
+            wait_for_element.__globals__['wait_for_element'] = original_wait_for_element
+
+def run_tests():
+    """Run all unit tests."""
+    test_loader = unittest.TestLoader()
+    test_suite = unittest.TestSuite()
+    
+    test_suite.addTest(test_loader.loadTestsFromTestCase(TestSoraUtils))
+    test_suite.addTest(test_loader.loadTestsFromTestCase(TestRetryDecorator))
+    test_suite.addTest(test_loader.loadTestsFromTestCase(TestWaitForElement))
+    test_suite.addTest(test_loader.loadTestsFromTestCase(TestDownloadImage))
+    
+    test_runner = unittest.TextTestRunner(verbosity=2)
+    return test_runner.run(test_suite)
+
 if __name__ == "__main__":
-    unittest.main()
+    run_tests()
