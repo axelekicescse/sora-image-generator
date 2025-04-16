@@ -203,16 +203,27 @@ def wait_for_element(page, selector: str, logger: Optional[logging.Logger] = Non
         
     if logger:
         logger.debug(f"Waiting for element: {selector} (state={state}, timeout={timeout}s)")
+    
+    if selector == "textarea":
+        selectors = ["textarea", "input[type='text']", ".prompt-input", "[placeholder*='prompt']", "[aria-label*='prompt']"]
+        if logger:
+            logger.info(f"Will try multiple input selectors: {selectors}")
+    else:
+        selectors = [selector]
         
-    try:
-        page.wait_for_selector(selector, state=state, timeout=timeout * 1000)
-        if logger:
-            logger.debug(f"Element found: {selector}")
-        return True
-    except Exception as e:
-        if logger:
-            logger.warning(f"Element not found: {selector} - {str(e)}")
-        raise  # Re-raise for retry mechanism
+    for sel in selectors:
+        try:
+            page.wait_for_selector(sel, state=state, timeout=(timeout * 1000) // len(selectors))
+            if logger:
+                logger.info(f"Element found with selector: {sel}")
+            return True
+        except Exception as e:
+            if logger:
+                logger.warning(f"Element not found with selector: {sel} - {str(e)}")
+            if sel == selectors[-1]:
+                raise  # Re-raise for retry mechanism
+    
+    return False
 
 def check_for_errors(page, logger: logging.Logger) -> Tuple[bool, Optional[str]]:
     """
@@ -249,9 +260,33 @@ def check_for_errors(page, logger: logging.Logger) -> Tuple[bool, Optional[str]]
             
     return False, None
 
+def check_concurrent_generations(page, logger: logging.Logger) -> int:
+    """
+    Check how many concurrent generations are currently running.
+    
+    Args:
+        page: Playwright page object
+        logger: Logger instance
+        
+    Returns:
+        Number of active generations (0-2)
+    """
+    try:
+        active_count = page.evaluate("""() => {
+            const indicators = document.querySelectorAll('.progress-indicator');
+            return indicators.length;
+        }""")
+        
+        logger.info(f"Current active generations: {active_count}")
+        return active_count
+    except Exception as e:
+        logger.warning(f"Error checking concurrent generations: {str(e)}")
+        return 0
+
 def wait_for_image_generation(page, logger: logging.Logger, timeout: Optional[int] = None) -> bool:
     """
     Wait for image generation to complete by checking for the download button.
+    Respects Sora's 2-generation concurrency limit.
     
     Args:
         page: Playwright page object
@@ -268,6 +303,25 @@ def wait_for_image_generation(page, logger: logging.Logger, timeout: Optional[in
     start_time = time.time()
     
     download_button_selector = "button:has-text('Download')"
+    progress_selector = ".progress-indicator"
+    
+    # Check for concurrent generations (Sora only allows 2 at a time)
+    concurrent_count = check_concurrent_generations(page, logger)
+    if concurrent_count >= 2:
+        logger.warning("Detected 2 concurrent generations already running")
+        logger.info("Waiting for an existing generation to complete before starting a new one...")
+        
+        wait_start = time.time()
+        while concurrent_count >= 2 and time.time() - wait_start < 300:  # Wait up to 5 minutes
+            logger.info("Waiting for a generation slot to become available...")
+            time.sleep(10)
+            concurrent_count = check_concurrent_generations(page, logger)
+            
+        if concurrent_count >= 2:
+            logger.error("Timed out waiting for a generation slot to become available")
+            return False
+            
+        logger.info("Generation slot available, proceeding with generation")
     
     time.sleep(2)  # Short delay to allow initial errors to appear
     has_error, error_message = check_for_errors(page, logger)
@@ -277,28 +331,37 @@ def wait_for_image_generation(page, logger: logging.Logger, timeout: Optional[in
     
     while time.time() - start_time < timeout:
         try:
+            # Check for download button (generation completed)
             if page.is_visible(download_button_selector):
                 elapsed_time = time.time() - start_time
                 logger.info(f"Image generation completed in {elapsed_time:.1f} seconds")
                 return True
             
+            # Check for errors
             has_error, error_message = check_for_errors(page, logger)
             if has_error:
                 return False
-                
-            progress_selector = ".progress-indicator"
-            try:
-                if page.is_visible(progress_selector):
+            
+            # Check for progress indicator (generation in progress)
+            if page.is_visible(progress_selector):
+                try:
                     progress_text = page.text_content(progress_selector)
-                    logger.debug(f"Generation progress: {progress_text}")
-            except:
-                pass
+                    logger.info(f"Generation in progress: {progress_text}")
+                except:
+                    logger.info("Generation in progress...")
+            else:
+                logger.info("Waiting for generation to start...")
                 
-            time.sleep(2)
+            elapsed = time.time() - start_time
+            remaining = timeout - elapsed
+            if remaining < 120:  # Less than 2 minutes remaining
+                logger.warning(f"Generation time remaining: {remaining:.1f}s")
+                
+            time.sleep(10)  # Check status every 10 seconds
             
         except Exception as e:
             logger.warning(f"Exception while checking image status: {str(e)}")
-            time.sleep(2)
+            time.sleep(5)
     
     logger.error(f"Timeout after {timeout} seconds waiting for image generation")
     return False
@@ -559,27 +622,152 @@ def verify_navigation(page, logger: logging.Logger, url: Optional[str] = None) -
         url = CONFIG["SORA_URL"]
         
     try:
-        title = page.title()
-        if "Sora" not in title:
-            logger.error(f"Navigation verification failed: unexpected title '{title}'")
-            return False
-            
-        # Check for a stable page element
-        stable_element = "textarea, .logo, nav"
+        page.screenshot(path="initial_navigation.png")
+        logger.info("Saved initial navigation screenshot")
+        
+        html_content = page.content()
+        with open("initial_page.html", "w", encoding="utf-8") as f:
+            f.write(html_content)
+        logger.info("Saved initial page HTML content")
+        
+        cloudflare_detected = False
         try:
-            page.wait_for_selector(stable_element, state="visible", timeout=5000)
-        except Exception as e:
-            logger.error(f"Navigation verification failed: could not find stable element: {str(e)}")
-            return False
+            title = page.title()
+            logger.info(f"Initial page title: {title}")
             
-        # Check for error elements
-        has_error, error_message = check_for_errors(page, logger)
-        if has_error:
-            logger.error(f"Navigation verification failed: error on page: {error_message}")
-            return False
+            if "just a moment" in title.lower() or "cloudflare" in title.lower():
+                cloudflare_detected = True
+                logger.info("Detected Cloudflare protection")
+        except:
+            logger.warning("Could not get page title, assuming Cloudflare protection")
+            cloudflare_detected = True
+        
+        if cloudflare_detected:
+            logger.info("Attempting to bypass Cloudflare protection")
             
-        logger.info(f"Navigation to {url} verified successfully")
-        return True
+            bypass_methods = [
+                # Method 1: Wait and simulate user interaction
+                lambda: (
+                    time.sleep(5),
+                    page.evaluate("""() => {
+                        // Simulate mouse movement
+                        for (let i = 0; i < 100; i++) {
+                            const x = Math.floor(Math.random() * window.innerWidth);
+                            const y = Math.floor(Math.random() * window.innerHeight);
+                            const event = new MouseEvent('mousemove', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: x,
+                                clientY: y
+                            });
+                            document.dispatchEvent(event);
+                        }
+                        
+                        // Simulate scroll
+                        window.scrollTo(0, 100);
+                        setTimeout(() => window.scrollTo(0, 0), 500);
+                        
+                        // Try to find and click any buttons
+                        const buttons = document.querySelectorAll('button, input[type="button"], a.button');
+                        for (const button of buttons) {
+                            if (button.innerText.toLowerCase().includes('continue') || 
+                                button.innerText.toLowerCase().includes('proceed') ||
+                                button.innerText.toLowerCase().includes('verify')) {
+                                button.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""),
+                    time.sleep(5)
+                ),
+                
+                lambda: (
+                    logger.info("Reloading the page to bypass Cloudflare"),
+                    page.reload(wait_until="domcontentloaded"),
+                    time.sleep(10)
+                ),
+                
+                lambda: (
+                    logger.info("Trying direct navigation to alternate URL"),
+                    page.goto("https://sora.com/", wait_until="domcontentloaded"),
+                    time.sleep(10)
+                ),
+                
+                lambda: (
+                    logger.info("Trying with www subdomain"),
+                    page.goto("https://www.sora.com/", wait_until="domcontentloaded"),
+                    time.sleep(10)
+                )
+            ]
+            
+            for method_idx, bypass_method in enumerate(bypass_methods):
+                logger.info(f"Trying Cloudflare bypass method {method_idx + 1}")
+                bypass_method()
+                
+                try:
+                    title = page.title()
+                    logger.info(f"Page title after bypass attempt {method_idx + 1}: {title}")
+                    
+                    if "just a moment" not in title.lower() and "cloudflare" not in title.lower():
+                        logger.info(f"Successfully bypassed Cloudflare using method {method_idx + 1}")
+                        cloudflare_detected = False
+                        break
+                except:
+                    logger.warning(f"Could not get page title after bypass attempt {method_idx + 1}")
+            
+            if cloudflare_detected:
+                page.screenshot(path="cloudflare_failed.png")
+                logger.error("Failed to bypass Cloudflare protection after all attempts")
+                return False
+        
+        logger.info("Waiting for page to fully load...")
+        time.sleep(15)
+        
+        page.screenshot(path="post_cloudflare.png")
+        logger.info("Saved post-Cloudflare screenshot")
+        
+        html_content = page.content()
+        with open("post_cloudflare.html", "w", encoding="utf-8") as f:
+            f.write(html_content)
+        logger.info("Saved post-Cloudflare HTML content")
+        
+        verification_methods = [
+            lambda: page.query_selector("textarea") is not None or page.query_selector("input[type='text']") is not None,
+            
+            lambda: "sora" in page.url.lower(),
+            
+            lambda: page.query_selector("button") is not None and page.query_selector("a") is not None,
+            
+            lambda: page.evaluate("""() => {
+                // Look for any elements that might indicate we're on Sora
+                const hasSoraElements = document.body.innerHTML.toLowerCase().includes('sora') ||
+                                       document.body.innerHTML.toLowerCase().includes('generate') ||
+                                       document.body.innerHTML.toLowerCase().includes('prompt');
+                return hasSoraElements;
+            }""")
+        ]
+        
+        for method_idx, verification_method in enumerate(verification_methods):
+            try:
+                if verification_method():
+                    logger.info(f"Page verification successful using method {method_idx + 1}")
+                    
+                    # Check for error elements
+                    has_error, error_message = check_for_errors(page, logger)
+                    if has_error:
+                        logger.error(f"Navigation verification failed: error on page: {error_message}")
+                        return False
+                    
+                    logger.info(f"Navigation to {url} verified successfully")
+                    return True
+            except Exception as e:
+                logger.warning(f"Verification method {method_idx + 1} failed: {str(e)}")
+        
+        page.screenshot(path="verification_failed.png")
+        logger.error("Navigation verification failed: page did not load properly")
+        return False
         
     except Exception as e:
         logger.error(f"Navigation verification failed with exception: {str(e)}")

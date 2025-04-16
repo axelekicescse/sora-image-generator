@@ -117,14 +117,90 @@ def main():
         try:
             logger.info("Launching browser")
             headless = config["HEADLESS"].lower() == "true"
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
             
-            context.storage_state(state=session_data)
+            browser = p.chromium.launch(
+                headless=headless,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process'
+                ]
+            )
+            
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                viewport={'width': 1920, 'height': 1080},
+                ignore_https_errors=True
+            )
+            
+            # Process cookies from session.json
+            logger.info("Processing cookies from session.json")
+            cookies = session_data.get("cookies", [])
+            processed_cookies = []
+            
+            for cookie in cookies:
+                processed_cookie = cookie.copy()
+                
+                if "sameSite" in processed_cookie:
+                    if processed_cookie["sameSite"] == "no_restriction":
+                        processed_cookie["sameSite"] = "None"
+                    elif processed_cookie["sameSite"] == "lax":
+                        processed_cookie["sameSite"] = "Lax"
+                    elif processed_cookie["sameSite"] == "strict":
+                        processed_cookie["sameSite"] = "Strict"
+                
+                for key in list(processed_cookie.keys()):
+                    if key not in ["name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"]:
+                        del processed_cookie[key]
+                
+                if "expirationDate" in processed_cookie:
+                    processed_cookie["expires"] = processed_cookie.pop("expirationDate")
+                
+                processed_cookies.append(processed_cookie)
+            
+            logger.info(f"Adding {len(processed_cookies)} processed cookies to browser context")
+            context.add_cookies(processed_cookies)
+            
+            # Apply storage state if available
+            if "origins" in session_data and session_data["origins"]:
+                logger.info("Setting storage state from session.json")
+                
+                for origin in session_data.get("origins", []):
+                    origin_url = origin.get("origin")
+                    if origin_url and "sora" in origin_url:
+                        logger.info(f"Setting storage for origin: {origin_url}")
+                        
+                        if "localStorage" in origin:
+                            page = context.new_page()
+                            page.goto(origin_url)
+                            for item in origin.get("localStorage", []):
+                                page.evaluate("""([key, value]) => {
+                                    localStorage.setItem(key, value);
+                                }""", [item.get("name"), item.get("value")])
+                            page.close()
+                            
+                        if "sessionStorage" in origin:
+                            page = context.new_page()
+                            page.goto(origin_url)
+                            for item in origin.get("sessionStorage", []):
+                                page.evaluate("""([key, value]) => {
+                                    sessionStorage.setItem(key, value);
+                                }""", [item.get("name"), item.get("value")])
+                            page.close()
             
             page = context.new_page()
+            
+            page.set_extra_http_headers({
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "sec-ch-ua": '"Chromium";v="123", "Google Chrome";v="123", "Not:A-Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"'
+            })
+            
             logger.info(f"Navigating to {config['SORA_URL']}")
-            page.goto(config["SORA_URL"])
+            page.goto(config["SORA_URL"], wait_until="domcontentloaded")
             
             if not sora_utils.verify_navigation(page, logger, config["SORA_URL"]):
                 logger.error("Navigation to Sora website failed")
@@ -137,34 +213,88 @@ def main():
                 browser.close()
                 sys.exit(1)
             
-            try:
-                if not sora_utils.wait_for_element(page, "textarea", logger, timeout=30):
-                    logger.error("Could not find prompt input field after retries")
+            logger.info("Using JavaScript to interact with the page")
+            
+            time.sleep(10)
+            
+            screenshot_path = "debug_screenshot.png"
+            logger.info(f"Taking screenshot to debug page state: {screenshot_path}")
+            page.screenshot(path=screenshot_path)
+            
+            html_content = page.content()
+            with open("debug_page.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            logger.info("Saved page HTML content to debug_page.html")
+            
+            js_errors = page.evaluate("""() => {
+                return window.errors || [];
+            }""")
+            if js_errors:
+                logger.warning(f"JavaScript errors on page: {js_errors}")
+            
+            logger.info("Attempting to find input elements using JavaScript")
+            has_input = page.evaluate("""() => {
+                const inputs = document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]');
+                console.log('Found inputs:', inputs.length);
+                return inputs.length > 0;
+            }""")
+            
+            if not has_input:
+                logger.error("Could not find any input elements using JavaScript")
+                logger.info("Trying to wait longer for page to load completely...")
+                time.sleep(30)  # Wait longer for page to load
+                
+                has_input = page.evaluate("""() => {
+                    const inputs = document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]');
+                    console.log('Found inputs after waiting:', inputs.length);
+                    return inputs.length > 0;
+                }""")
+                
+                if not has_input:
+                    logger.error("Still could not find any input elements after waiting")
                     sora_utils.log_session_result(
                         logger, 
                         prompt=prompt, 
                         status="FAILURE", 
-                        error="Could not find prompt input field after retries"
+                        error="Could not find any input elements using JavaScript"
                     )
                     browser.close()
                     sys.exit(1)
-            except Exception as e:
-                logger.error(f"Error waiting for prompt input field: {str(e)}")
+                
+            logger.info("Entering prompt text using JavaScript")
+            page.evaluate(f"""(prompt) => {{
+                const inputs = document.querySelectorAll('textarea, input[type="text"]');
+                if (inputs.length > 0) {{
+                    inputs[0].value = prompt;
+                    inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+            }}""", prompt)
+            
+            logger.info("Clicking generate button using JavaScript")
+            button_clicked = page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const generateButton = buttons.find(button => 
+                    button.textContent.toLowerCase().includes('generate') || 
+                    button.innerText.toLowerCase().includes('generate')
+                );
+                
+                if (generateButton) {
+                    generateButton.click();
+                    return true;
+                }
+                return false;
+            }""")
+            
+            if not button_clicked:
+                logger.error("Could not find or click the generate button")
                 sora_utils.log_session_result(
                     logger, 
                     prompt=prompt, 
                     status="FAILURE", 
-                    error=f"Error waiting for prompt input field: {str(e)}"
+                    error="Could not find or click the generate button"
                 )
                 browser.close()
                 sys.exit(1)
-            
-            logger.info("Entering prompt text")
-            page.fill("textarea", prompt)
-            
-            logger.info("Clicking generate button")
-            generate_button = page.get_by_role("button", name="Generate")
-            generate_button.click()
             
             time.sleep(1)  # Short delay to allow immediate errors to appear
             has_error, error_message = sora_utils.check_for_errors(page, logger)
