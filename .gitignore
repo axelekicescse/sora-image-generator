@@ -2,3 +2,7 @@ session.json
 .env
 /images/
 /logs/
+# Debug files
+debug_*.png
+debug_*.html
+__pycache__/
