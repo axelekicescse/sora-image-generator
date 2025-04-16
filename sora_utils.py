@@ -604,17 +604,24 @@ class TestRetryDecorator(unittest.TestCase):
         
     def test_with_retry_decorator(self):
         """Test the with_retry decorator."""
-        mock_func = mock.Mock(side_effect=[Exception("First failure"), 
-                                          Exception("Second failure"), 
-                                          "Success"])
+        def test_func(logger):
+            if not hasattr(test_func, 'call_count'):
+                test_func.call_count = 0
+            test_func.call_count += 1
+            
+            if test_func.call_count == 1:
+                raise Exception("First failure")
+            elif test_func.call_count == 2:
+                raise Exception("Second failure")
+            else:
+                return "Success"
         
         # Apply the retry decorator
-        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(mock_func)
+        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(test_func)
         
         result = decorated_func(self.logger)
         
-        self.assertEqual(mock_func.call_count, 3)
-        
+        self.assertEqual(test_func.call_count, 3)
         self.assertEqual(result, "Success")
         
         log_output = self.log_stream.getvalue()
@@ -625,16 +632,20 @@ class TestRetryDecorator(unittest.TestCase):
         
     def test_with_retry_all_failures(self):
         """Test the with_retry decorator when all attempts fail."""
-        mock_func = mock.Mock(side_effect=Exception("Persistent failure"))
+        def test_func(logger):
+            if not hasattr(test_func, 'call_count'):
+                test_func.call_count = 0
+            test_func.call_count += 1
+            
+            raise Exception("Persistent failure")
         
         # Apply the retry decorator
-        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(mock_func)
+        decorated_func = with_retry(max_retries=3, retry_delay=0.1)(test_func)
         
         with self.assertRaises(Exception) as context:
             decorated_func(self.logger)
             
-        self.assertEqual(mock_func.call_count, 3)
-        
+        self.assertEqual(test_func.call_count, 3)
         self.assertEqual(str(context.exception), "Persistent failure")
         
         log_output = self.log_stream.getvalue()
