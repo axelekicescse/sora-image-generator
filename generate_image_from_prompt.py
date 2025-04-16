@@ -80,6 +80,9 @@ def main():
     logger = sora_utils.setup_logging()
     logger.info("Starting Sora image generation process")
     
+    timeout = int(config["MAX_SESSION_TIME"])
+    sora_utils.setup_global_timeout(timeout, logger)
+    
     start_time = time.time()
     
     prompt = read_prompt()
@@ -122,6 +125,17 @@ def main():
             page = context.new_page()
             logger.info(f"Navigating to {config['SORA_URL']}")
             page.goto(config["SORA_URL"])
+            
+            if not sora_utils.verify_navigation(page, logger, config["SORA_URL"]):
+                logger.error("Navigation to Sora website failed")
+                sora_utils.log_session_result(
+                    logger, 
+                    prompt=prompt, 
+                    status="FAILURE", 
+                    error="Navigation to Sora website failed"
+                )
+                browser.close()
+                sys.exit(1)
             
             try:
                 if not sora_utils.wait_for_element(page, "textarea", logger, timeout=30):
@@ -198,7 +212,12 @@ def main():
                 browser.close()
                 sys.exit(1)
             
-            elapsed_time = time.time() - start_time
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+            remaining_time = timeout - elapsed_time
+            
+            if remaining_time < 30:  # Less than 30 seconds remaining
+                logger.warning(f"Approaching global timeout limit. Only {remaining_time:.1f}s remaining of {timeout}s")
             
             sora_utils.log_session_result(
                 logger, 
