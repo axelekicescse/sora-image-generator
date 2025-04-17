@@ -15,9 +15,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
 
 import sora_utils
+from stealth_launcher import (
+    launch_stealth_browser,
+    setup_stealth_page,
+    apply_session_state,
+    handle_cloudflare_challenge,
+    verify_sora_access
+)
 
 def read_prompt(prompt_file: Optional[str] = None) -> Optional[str]:
     """
@@ -115,92 +122,54 @@ def main():
     
     with sync_playwright() as p:
         try:
-            logger.info("Launching browser")
+            logger.info("Launching stealth browser")
             headless = config["HEADLESS"].lower() == "true"
             
-            browser = p.chromium.launch(
+            browser, context = launch_stealth_browser(
                 headless=headless,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process'
-                ]
+                logger=logger
             )
             
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-                viewport={'width': 1920, 'height': 1080},
-                ignore_https_errors=True
-            )
-            
-            # Process cookies from session.json
-            logger.info("Processing cookies from session.json")
-            cookies = session_data.get("cookies", [])
-            processed_cookies = []
-            
-            for cookie in cookies:
-                processed_cookie = cookie.copy()
-                
-                if "sameSite" in processed_cookie:
-                    if processed_cookie["sameSite"] == "no_restriction":
-                        processed_cookie["sameSite"] = "None"
-                    elif processed_cookie["sameSite"] == "lax":
-                        processed_cookie["sameSite"] = "Lax"
-                    elif processed_cookie["sameSite"] == "strict":
-                        processed_cookie["sameSite"] = "Strict"
-                
-                for key in list(processed_cookie.keys()):
-                    if key not in ["name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"]:
-                        del processed_cookie[key]
-                
-                if "expirationDate" in processed_cookie:
-                    processed_cookie["expires"] = processed_cookie.pop("expirationDate")
-                
-                processed_cookies.append(processed_cookie)
-            
-            logger.info(f"Adding {len(processed_cookies)} processed cookies to browser context")
-            context.add_cookies(processed_cookies)
-            
-            # Apply storage state if available
-            if "origins" in session_data and session_data["origins"]:
-                logger.info("Setting storage state from session.json")
-                
-                for origin in session_data.get("origins", []):
-                    origin_url = origin.get("origin")
-                    if origin_url and "sora" in origin_url:
-                        logger.info(f"Setting storage for origin: {origin_url}")
-                        
-                        if "localStorage" in origin:
-                            page = context.new_page()
-                            page.goto(origin_url)
-                            for item in origin.get("localStorage", []):
-                                page.evaluate("""([key, value]) => {
-                                    localStorage.setItem(key, value);
-                                }""", [item.get("name"), item.get("value")])
-                            page.close()
-                            
-                        if "sessionStorage" in origin:
-                            page = context.new_page()
-                            page.goto(origin_url)
-                            for item in origin.get("sessionStorage", []):
-                                page.evaluate("""([key, value]) => {
-                                    sessionStorage.setItem(key, value);
-                                }""", [item.get("name"), item.get("value")])
-                            page.close()
+            # Apply session state from session.json
+            logger.info("Applying session state from session.json")
+            if not apply_session_state(context, "session.json", logger):
+                logger.error("Failed to apply session state from session.json")
+                sora_utils.log_session_result(
+                    logger, 
+                    prompt=prompt, 
+                    status="FAILURE", 
+                    error="Failed to apply session state from session.json"
+                )
+                browser.close()
+                sys.exit(1)
             
             page = context.new_page()
-            
-            page.set_extra_http_headers({
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "sec-ch-ua": '"Chromium";v="123", "Google Chrome";v="123", "Not:A-Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"'
-            })
+            page = setup_stealth_page(page, logger)
             
             logger.info(f"Navigating to {config['SORA_URL']}")
             page.goto(config["SORA_URL"], wait_until="domcontentloaded")
+            
+            if not handle_cloudflare_challenge(page, logger):
+                logger.error("Failed to bypass Cloudflare challenge")
+                sora_utils.log_session_result(
+                    logger, 
+                    prompt=prompt, 
+                    status="FAILURE", 
+                    error="Failed to bypass Cloudflare challenge"
+                )
+                browser.close()
+                sys.exit(1)
+            
+            if not verify_sora_access(page, logger):
+                logger.error("Failed to access Sora website - region restriction or other access issue")
+                sora_utils.log_session_result(
+                    logger, 
+                    prompt=prompt, 
+                    status="FAILURE", 
+                    error="Failed to access Sora website - region restriction or other access issue"
+                )
+                browser.close()
+                sys.exit(1)
             
             if not sora_utils.verify_navigation(page, logger, config["SORA_URL"]):
                 logger.error("Navigation to Sora website failed")
@@ -215,7 +184,7 @@ def main():
             
             logger.info("Using JavaScript to interact with the page")
             
-            time.sleep(10)
+            time.sleep(5)  # Reduced wait time as stealth mode should load faster
             
             screenshot_path = "debug_screenshot.png"
             logger.info(f"Taking screenshot to debug page state: {screenshot_path}")
@@ -234,20 +203,33 @@ def main():
             
             logger.info("Attempting to find input elements using JavaScript")
             has_input = page.evaluate("""() => {
-                const inputs = document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]');
-                console.log('Found inputs:', inputs.length);
-                return inputs.length > 0;
+                // Look for textarea at the bottom of the page (Sora's input)
+                const textareas = document.querySelectorAll('textarea');
+                const inputs = document.querySelectorAll('input[type="text"]');
+                const contentEditables = document.querySelectorAll('[contenteditable="true"]');
+                
+                console.log('Found textareas:', textareas.length);
+                console.log('Found text inputs:', inputs.length);
+                console.log('Found contentEditables:', contentEditables.length);
+                
+                return textareas.length > 0 || inputs.length > 0 || contentEditables.length > 0;
             }""")
             
             if not has_input:
                 logger.error("Could not find any input elements using JavaScript")
                 logger.info("Trying to wait longer for page to load completely...")
-                time.sleep(30)  # Wait longer for page to load
+                time.sleep(15)  # Wait longer for page to load, but less than before
                 
                 has_input = page.evaluate("""() => {
-                    const inputs = document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]');
-                    console.log('Found inputs after waiting:', inputs.length);
-                    return inputs.length > 0;
+                    const textareas = document.querySelectorAll('textarea');
+                    const inputs = document.querySelectorAll('input[type="text"]');
+                    const contentEditables = document.querySelectorAll('[contenteditable="true"]');
+                    
+                    console.log('Found textareas after waiting:', textareas.length);
+                    console.log('Found text inputs after waiting:', inputs.length);
+                    console.log('Found contentEditables after waiting:', contentEditables.length);
+                    
+                    return textareas.length > 0 || inputs.length > 0 || contentEditables.length > 0;
                 }""")
                 
                 if not has_input:
@@ -262,26 +244,107 @@ def main():
                     sys.exit(1)
                 
             logger.info("Entering prompt text using JavaScript")
-            page.evaluate(f"""(prompt) => {{
-                const inputs = document.querySelectorAll('textarea, input[type="text"]');
-                if (inputs.length > 0) {{
-                    inputs[0].value = prompt;
-                    inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+            input_success = page.evaluate(f"""(prompt) => {{
+                // Try multiple input methods
+                let inputSuccess = false;
+                
+                // Method 1: Find textarea (most likely for Sora)
+                const textareas = document.querySelectorAll('textarea');
+                if (textareas.length > 0) {{
+                    textareas[0].value = prompt;
+                    textareas[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    console.log('Entered prompt in textarea');
+                    inputSuccess = true;
                 }}
+                
+                // Method 2: Find input fields
+                if (!inputSuccess) {{
+                    const inputs = document.querySelectorAll('input[type="text"]');
+                    if (inputs.length > 0) {{
+                        inputs[0].value = prompt;
+                        inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        console.log('Entered prompt in text input');
+                        inputSuccess = true;
+                    }}
+                }}
+                
+                // Method 3: Find contentEditable elements
+                if (!inputSuccess) {{
+                    const contentEditables = document.querySelectorAll('[contenteditable="true"]');
+                    if (contentEditables.length > 0) {{
+                        contentEditables[0].textContent = prompt;
+                        contentEditables[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        console.log('Entered prompt in contentEditable');
+                        inputSuccess = true;
+                    }}
+                }}
+                
+                return inputSuccess;
             }}""", prompt)
             
-            logger.info("Clicking generate button using JavaScript")
+            if not input_success:
+                logger.error("Failed to enter prompt text")
+                sora_utils.log_session_result(
+                    logger, 
+                    prompt=prompt, 
+                    status="FAILURE", 
+                    error="Failed to enter prompt text"
+                )
+                browser.close()
+                sys.exit(1)
+            
+            logger.info("Looking for submit button (paper plane icon)")
             button_clicked = page.evaluate("""() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const generateButton = buttons.find(button => 
-                    button.textContent.toLowerCase().includes('generate') || 
-                    button.innerText.toLowerCase().includes('generate')
-                );
+                // Try multiple button finding strategies
                 
-                if (generateButton) {
-                    generateButton.click();
+                // Strategy 1: Look for paper plane icon (Sora's submit button)
+                const paperPlaneButtons = Array.from(document.querySelectorAll('button')).filter(button => {
+                    // Check for SVG with paper plane icon
+                    const svg = button.querySelector('svg');
+                    if (svg) {
+                        // Check if it looks like a paper plane icon
+                        const paths = svg.querySelectorAll('path');
+                        if (paths.length > 0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+                
+                if (paperPlaneButtons.length > 0) {
+                    console.log('Found paper plane button');
+                    paperPlaneButtons[0].click();
                     return true;
                 }
+                
+                // Strategy 2: Look for buttons with specific text
+                const textButtons = Array.from(document.querySelectorAll('button')).filter(button => {
+                    const text = button.textContent.toLowerCase();
+                    return text.includes('generate') || 
+                           text.includes('create') || 
+                           text.includes('submit') ||
+                           text.includes('send');
+                });
+                
+                if (textButtons.length > 0) {
+                    console.log('Found text button:', textButtons[0].textContent);
+                    textButtons[0].click();
+                    return true;
+                }
+                
+                // Strategy 3: Look for buttons next to the textarea
+                const textareas = document.querySelectorAll('textarea');
+                if (textareas.length > 0) {
+                    const textarea = textareas[0];
+                    const parent = textarea.parentElement;
+                    const buttons = parent.querySelectorAll('button');
+                    if (buttons.length > 0) {
+                        console.log('Found button next to textarea');
+                        buttons[0].click();
+                        return true;
+                    }
+                }
+                
                 return false;
             }""")
             
