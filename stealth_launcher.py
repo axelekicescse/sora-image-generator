@@ -196,15 +196,15 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         logger.info("Setting up stealth page")
     
     page.add_init_script("""
-    () => {
+    function() {
         // Override the webdriver property
         Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
+            get: function() { return undefined; }
         });
         
         // Override the plugins to include some
         Object.defineProperty(navigator, 'plugins', {
-            get: () => {
+            get: function() {
                 return [
                     {
                         0: {type: "application/pdf", suffixes: "pdf", description: "Portable Document Format"},
@@ -233,19 +233,19 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         
         // Override the languages property
         Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en', 'fr']
+            get: function() { return ['en-US', 'en', 'fr']; }
         });
         
         // Override the permissions API
         if (navigator.permissions) {
-            navigator.permissions.__proto__.query = async (parameters) => {
+            navigator.permissions.__proto__.query = function(parameters) {
                 return { state: 'granted', onchange: null };
             };
         }
         
         // Override the connection property
         Object.defineProperty(navigator, 'connection', {
-            get: () => {
+            get: function() {
                 return {
                     effectiveType: '4g',
                     rtt: 50,
@@ -257,22 +257,22 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         
         // Override the hardware concurrency
         Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
+            get: function() { return 8; }
         });
         
         // Override the device memory
         Object.defineProperty(navigator, 'deviceMemory', {
-            get: () => 8
+            get: function() { return 8; }
         });
         
         // Override the platform
         Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
+            get: function() { return 'Win32'; }
         });
         
         // Override the userAgent
         Object.defineProperty(navigator, 'userAgent', {
-            get: () => window.navigator.userAgent
+            get: function() { return window.navigator.userAgent; }
         });
         
         // Override the Chrome property
@@ -334,21 +334,24 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         };
         
         // Add missing function
-        window.navigator.javaEnabled = () => false;
+        window.navigator.javaEnabled = function() { return false; };
         
         // Override the permissions API
         const originalQuery = window.navigator.permissions?.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
+        window.navigator.permissions.query = function(parameters) {
+            if (parameters.name === 'notifications') {
+                return { state: Notification.permission, onchange: null };
+            } else {
+                return originalQuery(parameters);
+            }
+        };
         
         // Pass the Cloudflare test
         window.navigator.permissions.query = function(parameters) {
-            return Promise.resolve({
-                state: parameters.name === "notifications" ? "denied" : "granted"
-            });
+            return {
+                state: parameters.name === "notifications" ? "denied" : "granted",
+                onchange: null
+            };
         };
         
         // Prevent iframe detection
@@ -361,12 +364,12 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         } catch (e) {}
         
         // Spoof screen resolution
-        Object.defineProperty(window.screen, 'availWidth', { get: () => 1920 });
-        Object.defineProperty(window.screen, 'availHeight', { get: () => 1080 });
-        Object.defineProperty(window.screen, 'width', { get: () => 1920 });
-        Object.defineProperty(window.screen, 'height', { get: () => 1080 });
-        Object.defineProperty(window.screen, 'colorDepth', { get: () => 24 });
-        Object.defineProperty(window.screen, 'pixelDepth', { get: () => 24 });
+        Object.defineProperty(window.screen, 'availWidth', { get: function() { return 1920; } });
+        Object.defineProperty(window.screen, 'availHeight', { get: function() { return 1080; } });
+        Object.defineProperty(window.screen, 'width', { get: function() { return 1920; } });
+        Object.defineProperty(window.screen, 'height', { get: function() { return 1080; } });
+        Object.defineProperty(window.screen, 'colorDepth', { get: function() { return 24; } });
+        Object.defineProperty(window.screen, 'pixelDepth', { get: function() { return 24; } });
         
         // Add touch support
         const touchSupport = {
@@ -374,11 +377,11 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
             touchEvent: function() { return true; },
             touchStart: function() { return true; }
         };
-        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => touchSupport.maxTouchPoints });
+        Object.defineProperty(navigator, 'maxTouchPoints', { get: function() { return touchSupport.maxTouchPoints; } });
         
         // Add missing functions
         if (window.navigator.languages === undefined) {
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'languages', { get: function() { return ['en-US', 'en']; } });
         }
         
         // Override toString methods to avoid detection
@@ -400,9 +403,9 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
     """)
     
     page.evaluate("""
-    () => {
+    function() {
         // Add random mouse movements
-        const randomMouseMovement = () => {
+        const randomMouseMovement = function() {
             const event = new MouseEvent('mousemove', {
                 'view': window,
                 'bubbles': true,
@@ -417,7 +420,7 @@ def setup_stealth_page(page: Page, logger: Optional[logging.Logger] = None) -> P
         setInterval(randomMouseMovement, Math.floor(Math.random() * 2000) + 1000);
         
         // Simulate random scrolling
-        const randomScroll = () => {
+        const randomScroll = function() {
             window.scrollBy({
                 top: Math.floor(Math.random() * 100) - 50,
                 behavior: 'smooth'
@@ -500,18 +503,20 @@ def apply_session_state(context: BrowserContext, session_file: str, logger: Opti
                         page = context.new_page()
                         page.goto(origin_url)
                         for item in origin.get("localStorage", []):
-                            page.evaluate("""([key, value]) => {
+                            page.evaluate("""function(key, value) {
                                 localStorage.setItem(key, value);
-                            }""", [item.get("name"), item.get("value")])
+                                return true;
+                            }""", item.get("name"), item.get("value"))
                         page.close()
                         
                     if "sessionStorage" in origin:
                         page = context.new_page()
                         page.goto(origin_url)
                         for item in origin.get("sessionStorage", []):
-                            page.evaluate("""([key, value]) => {
+                            page.evaluate("""function(key, value) {
                                 sessionStorage.setItem(key, value);
-                            }""", [item.get("name"), item.get("value")])
+                                return true;
+                            }""", item.get("name"), item.get("value"))
                         page.close()
         
         if logger:
@@ -538,7 +543,7 @@ def handle_cloudflare_challenge(page: Page, logger: Optional[logging.Logger] = N
     if logger:
         logger.info("Checking for Cloudflare challenge")
     
-    is_cloudflare = page.evaluate("""() => {
+    is_cloudflare = page.evaluate("""function() {
         return document.title.includes("Cloudflare") || 
                document.title.includes("Just a moment") ||
                document.body.innerText.includes("Cloudflare") ||
@@ -575,7 +580,7 @@ def handle_cloudflare_challenge(page: Page, logger: Optional[logging.Logger] = N
     
     page.wait_for_timeout(10000)
     
-    still_cloudflare = page.evaluate("""() => {
+    still_cloudflare = page.evaluate("""function() {
         return document.title.includes("Cloudflare") || 
                document.title.includes("Just a moment") ||
                document.body.innerText.includes("Cloudflare") ||
@@ -594,7 +599,7 @@ def handle_cloudflare_challenge(page: Page, logger: Optional[logging.Logger] = N
         
         page.wait_for_timeout(15000)
         
-        final_check = page.evaluate("""() => {
+        final_check = page.evaluate("""function() {
             return document.title.includes("Cloudflare") || 
                    document.title.includes("Just a moment") ||
                    document.body.innerText.includes("Cloudflare") ||
@@ -625,7 +630,7 @@ def verify_sora_access(page: Page, logger: Optional[logging.Logger] = None) -> b
     if logger:
         logger.info("Verifying Sora access")
     
-    region_restricted = page.evaluate("""() => {
+    region_restricted = page.evaluate("""function() {
         return document.body.innerText.includes("not available in your country") ||
                document.body.innerText.includes("not available in your region");
     }""")
@@ -635,7 +640,7 @@ def verify_sora_access(page: Page, logger: Optional[logging.Logger] = None) -> b
             logger.error("Sora is not available in the current region/country")
         return False
     
-    has_interface = page.evaluate("""() => {
+    has_interface = page.evaluate("""function() {
         // Look for common Sora interface elements
         const hasTextarea = !!document.querySelector('textarea');
         const hasInputField = !!document.querySelector('input[type="text"]');
